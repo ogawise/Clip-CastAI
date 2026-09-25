@@ -1,0 +1,329 @@
+"""
+ClipCast AI - Component 3: Branding and Captions.
+
+Adds a logo, channel name, optional title, call-to-action and optional
+burned-in subtitles on top of an overlay.py output video. Audio is copied
+through unchanged.
+
+Usage:
+    python brand.py --input outputs/test_result.mp4 --output outputs/branded_result.mp4
+        [--logo assets/logo.png] [--channel "ClipCast"] [--title "Why cats slow blink"]
+        [--cta "Follow for more"] [--subtitles captions.srt]
+"""
+
+import argparse
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+from pathlib import Path
+
+# --- Configuration ----------------------------------------------------------
+# Layout is designed for overlay.py's 1080x1920 output, where the POV PIP
+# occupies the bottom-right corner from y=1314 down. Captions and CTA are
+# stacked above that zone, which also keeps them clear of Instagram's UI.
+
+FONT_FILE = Path("C:/Windows/Fonts/arialbd.ttf")  # Arial Bold; change on macOS/Linux
+FONT_NAME = "Arial"  # family name inside FONT_FILE, used for subtitles
+
+EDGE_PADDING_PX = 40
+
+LOGO_SIZE_PX = 108  # 10% of 1080
+PLACEHOLDER_LOGO_COLOR = "0x2563EB"  # blue circle with "LOGO" on it
+
+CHANNEL_FONT_SIZE = 40
+
+TITLE_TOP_Y = 200  # below the logo row and Instagram's top UI
+TITLE_FONT_SIZE = 64
+TITLE_WRAP_CHARS = 24  # ~fits 1080px at 64px Arial Bold
+TITLE_MAX_LINES = 3
+
+CTA_BOTTOM_Y = 1250  # bottom edge of the CTA text; the PIP starts at 1314
+CTA_FONT_SIZE = 52
+
+SUBTITLE_BOTTOM_Y = 1140  # bottom edge of subtitle lines, just above the CTA box
+SUBTITLE_FONT_SIZE = 56
+SUBTITLE_OUTLINE_PX = 4
+
+# Text readability: white text on a semi-transparent black box.
+TEXT_COLOR = "white"
+BOX_COLOR = "black@0.55"
+BOX_PADDING_PX = 24
+
+VIDEO_PRESET = "medium"
+VIDEO_CRF = 23
+
+# ffmpeg converts .srt files to ASS subtitles on a virtual 384x288 canvas and
+# libass scales that canvas to the real frame, so subtitle sizes and margins
+# must be given in those units rather than pixels.
+ASS_PLAY_RES_X = 384
+ASS_PLAY_RES_Y = 288
+
+
+# --- Helpers ----------------------------------------------------------------
+
+def probe_video(ffprobe, path):
+    """Return (width, height) of the first video stream."""
+    result = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(path)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or "x" not in result.stdout:
+        raise RuntimeError(result.stderr.strip() or "no video stream found")
+    width, height = result.stdout.strip().split("x")[:2]
+    return int(width), int(height)
+
+
+def wrap_title(title):
+    """Break the title into centred lines; drawtext does not wrap on its own."""
+    lines = textwrap.wrap(title, width=TITLE_WRAP_CHARS)
+    return "\n".join(lines), len(lines)
+
+
+def drawtext(textfile, font_size, x, y, boxed=True):
+    """Build one drawtext filter reading its text from a file.
+
+    textfile + expansion=none means the text is never parsed by ffmpeg, so
+    colons, quotes, commas and % signs in titles are all safe.
+    """
+    opts = [
+        "fontfile=font.ttf",
+        f"textfile={textfile}",
+        "expansion=none",
+        f"fontsize={font_size}",
+        f"fontcolor={TEXT_COLOR}",
+        "text_align=C",
+        "line_spacing=12",
+        f"x={x}",
+        f"y={y}",
+    ]
+    if boxed:
+        opts += ["box=1", f"boxcolor={BOX_COLOR}", f"boxborderw={BOX_PADDING_PX}"]
+    else:
+        opts += ["borderw=3", "bordercolor=black"]
+    return "drawtext=" + ":".join(opts)
+
+
+def subtitle_style(width, height):
+    """libass force_style string, with pixel values converted to ASS units."""
+    y_unit = ASS_PLAY_RES_Y / height
+    x_unit = ASS_PLAY_RES_X / width
+    fields = {
+        "Fontname": FONT_NAME,
+        "Bold": 1,
+        "Fontsize": round(SUBTITLE_FONT_SIZE * y_unit, 2),
+        "PrimaryColour": "&H00FFFFFF",  # white (ASS colours are &HAABBGGRR)
+        "OutlineColour": "&H00000000",  # black
+        "BorderStyle": 1,  # outline + shadow, no box
+        "Outline": round(SUBTITLE_OUTLINE_PX * y_unit, 2),
+        "Shadow": 0,
+        "Alignment": 2,  # bottom centre
+        "MarginV": round((height - SUBTITLE_BOTTOM_Y) * y_unit),
+        "MarginL": round(EDGE_PADDING_PX * 2 * x_unit),
+        "MarginR": round(EDGE_PADDING_PX * 2 * x_unit),
+    }
+    return ",".join(f"{key}={value}" for key, value in fields.items())
+
+
+def build_filter_graph(width, height, logo_height, has_logo_file, has_channel, has_title, has_cta,
+                       has_subtitles):
+    """Build the -filter_complex string. Input 0 is the video, input 1 the logo PNG (if any).
+
+    Every file the filters read (font, text files, subtitles) lives in the
+    working directory ffmpeg runs in, so no Windows path escaping is needed.
+    """
+    chains = []
+
+    if has_logo_file:
+        chains.append(f"[1:v]scale={LOGO_SIZE_PX}:-1,format=rgba[logo]")
+    else:
+        # Placeholder logo generated by ffmpeg itself: a solid square, made
+        # into a circle by setting pixels outside the radius transparent.
+        chains.append(
+            f"color=c={PLACEHOLDER_LOGO_COLOR}:s={LOGO_SIZE_PX}x{LOGO_SIZE_PX}:d=1,format=rgba,"
+            "geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lte(hypot(X-W/2,Y-H/2),W/2),255,0)',"
+            f"drawtext=fontfile=font.ttf:text=LOGO:fontsize={LOGO_SIZE_PX // 4}:fontcolor=white:"
+            "x=(w-text_w)/2:y=(h-text_h)/2[logo]"
+        )
+
+    # A single-frame logo is held on screen for the whole video, because
+    # overlay repeats the last frame of a shorter input by default.
+    steps = [f"[0:v][logo]overlay={EDGE_PADDING_PX}:{EDGE_PADDING_PX}"]
+
+    if has_channel:
+        steps.append(drawtext(
+            "channel.txt", CHANNEL_FONT_SIZE,
+            x=EDGE_PADDING_PX + LOGO_SIZE_PX + 20,
+            y=f"{EDGE_PADDING_PX}+({logo_height}-text_h)/2",  # centred on the logo
+            boxed=False,
+        ))
+    if has_title:
+        steps.append(drawtext("title.txt", TITLE_FONT_SIZE, x="(w-text_w)/2", y=TITLE_TOP_Y))
+    if has_cta:
+        steps.append(drawtext("cta.txt", CTA_FONT_SIZE, x="(w-text_w)/2", y=f"{CTA_BOTTOM_Y}-text_h"))
+    if has_subtitles:
+        steps.append(f"subtitles=subs.srt:fontsdir=.:force_style='{subtitle_style(width, height)}'")
+
+    steps.append("format=yuv420p[v]")
+    chains.append(",".join(steps))
+    return ";".join(chains)
+
+
+def format_command(cmd):
+    """Render the argument list as a command you can paste into PowerShell, cmd or bash.
+
+    Only used for display: subprocess.run() receives the list itself.
+    """
+    special = set(" ;[]()&|<>'")
+    return " ".join(f'"{arg}"' if special & set(arg) else arg for arg in cmd)
+
+
+# --- Main -------------------------------------------------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Add logo, title, call-to-action and subtitles to an overlay.py video."
+    )
+    parser.add_argument("--input", required=True, type=Path, help="overlay.py output video")
+    parser.add_argument("--output", required=True, type=Path, help="branded output video path (.mp4)")
+    parser.add_argument("--logo", type=Path, help="logo PNG (default: generated placeholder)")
+    parser.add_argument("--channel", default="ClipCast",
+                        help='channel name shown beside the logo (default "ClipCast"; "" to hide)')
+    parser.add_argument("--title", help="title text near the top (omitted if not given)")
+    parser.add_argument("--cta", default="Follow for more",
+                        help='call-to-action text (default "Follow for more"; "" to hide)')
+    parser.add_argument("--subtitles", type=Path, help=".srt file to burn in (skipped if not given)")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    if not args.input.is_file():
+        print(f"Error: Input video file does not exist:\n{args.input}", file=sys.stderr)
+        return 1
+    if args.logo and not args.logo.is_file():
+        print(f"Error: Logo file does not exist:\n{args.logo}", file=sys.stderr)
+        return 1
+    if args.subtitles and not args.subtitles.is_file():
+        print(f"Error: Subtitles file does not exist:\n{args.subtitles}", file=sys.stderr)
+        return 1
+    if args.input.resolve() == args.output.resolve():
+        print("Error: --output must be different from --input.", file=sys.stderr)
+        return 1
+    if not FONT_FILE.is_file():
+        print(f"Error: Font file not found:\n{FONT_FILE}\nEdit FONT_FILE at the top of brand.py.",
+              file=sys.stderr)
+        return 1
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        print(
+            "Error: FFmpeg was not found on your system PATH.\n"
+            "Install FFmpeg and confirm that this command works:\n"
+            "ffmpeg -version",
+            file=sys.stderr,
+        )
+        return 1
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        print(
+            "Error: ffprobe was not found on your system PATH.\n"
+            "It ships with FFmpeg; confirm that this command works:\n"
+            "ffprobe -version",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        width, height = probe_video(ffprobe, args.input)
+    except RuntimeError as exc:
+        print(f"Error: Could not read the input video:\n{exc}", file=sys.stderr)
+        return 1
+
+    # The logo is scaled to LOGO_SIZE_PX wide; its height follows its aspect ratio.
+    logo_height = LOGO_SIZE_PX
+    if args.logo:
+        try:
+            logo_w, logo_h = probe_video(ffprobe, args.logo)
+        except RuntimeError as exc:
+            print(f"Error: Could not read the logo image:\n{exc}", file=sys.stderr)
+            return 1
+        logo_height = round(LOGO_SIZE_PX * logo_h / logo_w)
+
+    title_text, title_lines = wrap_title(args.title) if args.title else ("", 0)
+
+    print(f"Input:     {args.input} ({width}x{height})")
+    print(f"Output:    {args.output}")
+    print(f"Logo:      {args.logo if args.logo else 'placeholder (generated)'}"
+          f" - top-left, {LOGO_SIZE_PX}px")
+    print(f"Channel:   {args.channel!r}" if args.channel else "Channel:   (hidden)")
+    print(f"Title:     {args.title!r} ({title_lines} line(s))" if args.title else "Title:     (none)")
+    print(f"CTA:       {args.cta!r}" if args.cta else "CTA:       (hidden)")
+    print(f"Subtitles: {args.subtitles}" if args.subtitles else "Subtitles: (none)")
+    print("Audio:     copied unchanged from input")
+    if (width, height) != (1080, 1920):
+        print(f"Warning: layout is designed for 1080x1920; this input is {width}x{height}.")
+    if title_lines > TITLE_MAX_LINES:
+        print(f"Warning: title wraps to {title_lines} lines; consider shortening it.")
+
+    # Inputs and output become absolute paths because ffmpeg runs in a temp dir.
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-stats", "-y",
+           "-i", str(args.input.resolve())]
+    if args.logo:
+        cmd += ["-i", str(args.logo.resolve())]
+
+    graph = build_filter_graph(
+        width, height, logo_height,
+        has_logo_file=bool(args.logo),
+        has_channel=bool(args.channel),
+        has_title=bool(args.title),
+        has_cta=bool(args.cta),
+        has_subtitles=bool(args.subtitles),
+    )
+    cmd += [
+        "-filter_complex", graph,
+        "-map", "[v]",
+        "-map", "0:a?",  # keep the input's audio if it has any...
+        "-c:v", "libx264", "-preset", VIDEO_PRESET, "-crf", str(VIDEO_CRF),
+        "-c:a", "copy",  # ...and copy it without re-encoding
+        "-movflags", "+faststart",
+        str(args.output.resolve()),
+    ]
+
+    with tempfile.TemporaryDirectory(prefix="clipcast_brand_") as workdir:
+        work = Path(workdir)
+        shutil.copyfile(FONT_FILE, work / "font.ttf")
+        # newline="\n" stops Windows writing \r\n, which drawtext renders as an extra line.
+        if args.channel:
+            (work / "channel.txt").write_text(args.channel, encoding="utf-8", newline="\n")
+        if args.title:
+            (work / "title.txt").write_text(title_text, encoding="utf-8", newline="\n")
+        if args.cta:
+            (work / "cta.txt").write_text(args.cta, encoding="utf-8", newline="\n")
+        if args.subtitles:
+            shutil.copyfile(args.subtitles, work / "subs.srt")
+
+        print()
+        print(f"Running FFmpeg command (in temp folder {work}):")
+        print(format_command(cmd))
+        print()
+        sys.stdout.flush()
+        result = subprocess.run(cmd, cwd=work)
+
+    if result.returncode != 0:
+        print(f"\nError: FFmpeg failed with exit code {result.returncode} (see its output above).",
+              file=sys.stderr)
+        return result.returncode
+
+    print(f"\nOutput created successfully:\n{args.output}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
