@@ -1,0 +1,13 @@
+# Core (Phase 1 - content sourcing)
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# Video processing (overlay.py, brand.py) uses FFmpeg installed on PATH - no Python package.
+
+# AI script generation (script.py)
+anthropic>=1.8.0
+# jiter 0.16+ is blocked by Windows Smart App Control on this machine; 0.13.0 loads fine.
+jiter==0.13.0
+
+# Scheduling (optional, later)
+# celery>=5.4.0

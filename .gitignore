@@ -1,0 +1,16 @@
+# Secrets
+.env
+
+# Runtime data
+downloads/
+clips.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+outputs/
+test_pov.mp4
+
+# Project pipeline database (db.py)
+pipeline.db
